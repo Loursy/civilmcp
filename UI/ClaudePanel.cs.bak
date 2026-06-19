@@ -1,0 +1,773 @@
+﻿using System;
+using System.Collections.ObjectModel;
+using System.IO;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
+using CivilClaudePlugin.Api;
+using CivilClaudePlugin.Helpers;
+using Newtonsoft.Json;
+
+namespace CivilClaudePlugin.UI
+{
+    public class ChatMessage
+    {
+        public string Text { get; set; }
+        public Brush Background { get; set; }
+    }
+
+    public class ClaudePanel : UserControl
+    {
+        private ClaudeApiClient _client;
+        private readonly ObservableCollection<ChatMessage> _messages = new ObservableCollection<ChatMessage>();
+        private bool _injectContextNext = false;
+
+        private TextBox _userInput;
+        private PasswordBox _apiKeyBox;
+        private ListBox _chatMessages;
+        private ScrollViewer _chatScroll;
+        private WrapPanel _optionsPanel;
+        private ScrollViewer _optionsScroll;
+
+        private const string SystemPrompt =
+            "You are an expert Civil Engineering AI assistant embedded inside Autodesk Civil 3D. " +
+            "Help the user with design questions, calculations, standards (AASHTO, local), grading, " +
+            "surfaces, alignments, profiles, corridors, and AutoCAD/Civil 3D workflows. Be concise and practical.\n\n" +
+            "IMPORTANT: When the user asks to SELECT objects in the drawing (e.g. 'select red polylines', " +
+            "'kırmızı polylineları seç', 'select all lines on layer X'), you MUST respond with ONLY a JSON command " +
+            "in this exact format and nothing else:\n" +
+            "{\"command\":\"SELECT\",\"objectType\":\"polyline\",\"color\":\"kırmızı\",\"layer\":\"\"}\n\n" +
+            "objectType can be: polyline, line, arc, circle, text, mtext, block, hatch, or empty string for all.\n" +
+            "color can be: kırmızı, sarı, yeşil, cyan, mavi, magenta, beyaz, or empty string for all.\n" +
+            "layer can be any layer name or empty string for all.\n" +
+            "When the user asks to BIND all xrefs in all open drawings (e.g. 'tüm açık çizimlerdeki xrefleri bindle', " +
+            "'bind all xrefs', 'xrefleri bağla'), respond with ONLY this JSON and nothing else:\n" +
+            "{\"command\":\"BINDXREFS\"}\n\n" +
+            "When the user asks to CREATE ALIGNMENTS from polylines, you MUST first ask which style, label set, and layer to use. " +
+            "To get the available options, your ENTIRE response must be ONLY the JSON below with NO other text, NO explanation, NO markdown:\n" +
+            "{\"command\":\"LISTSTYLES\",\"source\":\"filter\",\"color\":\"kırmızı\",\"layer\":\"\"}\n" +
+            "Use source='selection' for already-selected objects, source='filter' with color/layer for filtered polylines.\n" +
+            "After the system shows the available styles/layers, the user will pick. Then create the alignments with ONLY this JSON:\n" +
+            "{\"command\":\"CREATEALIGNMENT\",\"source\":\"filter\",\"color\":\"kırmızı\",\"layer\":\"\",\"style\":\"chosen style\",\"labelSet\":\"chosen label set\",\"targetLayer\":\"chosen layer\",\"mainAlignment\":\"chosen main route\"}\n" +
+            "ALSO ask the user which existing alignment is the MAIN ROUTE (ana güzergah) - the created alignments will be numbered by their chainage along this main route.\n" +
+            "Remember the source/color/layer from the original request when building the final CREATEALIGNMENT command.\n\n" +
+            "When the user wants to RENAME alignments:\n" +
+            "- Rename one specific alignment: {\"command\":\"RENAMEONE\",\"oldName\":\"x\",\"newName\":\"y\"}\n" +
+            "- Add prefix/suffix to all: {\"command\":\"ADDFIX\",\"prefix\":\"x\",\"suffix\":\"y\"} (use empty string if not needed)\n" +
+            "- Find and replace in all names: {\"command\":\"FINDREPLACE\",\"find\":\"x\",\"replace\":\"y\"}\n" +
+            "- To see current alignment names first: {\"command\":\"LISTALIGNMENTS\"}\n" +
+            "Respond with ONLY the JSON, no other text.\n\n" +
+            "When the user wants to CREATE PIPE NETWORKS from alignments, you MUST first show available parts. " +
+            "Respond with ONLY this JSON: {\"command\":\"LISTPARTS\"}\n" +
+            "After the system shows parts lists, pipe and structure families, ask the user which parts list, pipe family, " +
+            "structure family, pipe style, structure style, and reference surface to use. " +
+            "Flow direction (akış yönü) is OPTIONAL - by default it follows the alignment direction ('start'). " +
+            "Only set flowDirection to 'end' or 'terrain' if the user explicitly asks for a different flow direction. " +
+            "Then create with ONLY this JSON:\n" +
+            "{\"command\":\"CREATEPIPENETWORK\",\"partsList\":\"x\",\"pipeFamily\":\"x\",\"structureFamily\":\"x\",\"pipeSize\":\"x\",\"structureSize\":\"x\",\"pipeStyle\":\"x\",\"structureStyle\":\"x\",\"surface\":\"x\",\"flowDirection\":\"start\"}\n" +
+            "Also ask the user which pipe SIZE and structure SIZE to use (from the listed sizes). If the user does not specify a size, leave pipeSize/structureSize empty to use the first available size.\n" +
+            "Respond with ONLY the JSON, no other text.\n\n" +
+            "When the user wants to DELETE pipes/structures, use ONLY ONE of these JSON commands:\n" +
+            "- By network name: {\"command\":\"DELETENETWORK\",\"networkName\":\"x\"}\n" +
+            "- Selected parts: {\"command\":\"DELETESELECTED\"}\n" +
+            "- By area: {\"command\":\"DELETEAREA\",\"minX\":\"0\",\"minY\":\"0\",\"maxX\":\"100\",\"maxY\":\"100\"}\n" +
+            "- By pipe diameter range (mm): {\"command\":\"DELETEDIAMETER\",\"minDia\":\"0\",\"maxDia\":\"300\"}\n" +
+            "- Duplicate structures at same location: {\"command\":\"DELETEDUPLICATES\",\"tolerance\":\"0.5\"}\n" +
+            "Respond with ONLY the JSON, no other text.\n\n" +
+            "When the user wants to CONNECT unconnected pipes to nearby structures (e.g. 'bağlı olmayan boruları structurelara bağla'), respond with ONLY this JSON:\n" +
+            "{\"command\":\"CONNECTPIPES\",\"tolerance\":\"0.5\"}\n" +
+            "Use the tolerance the user specifies, or 0.5 by default.\n\n" +
+            "When the user wants to APPLY RULES to pipes/structures (e.g. 'tüm borulara kuralları uygula', 'apply rules to all structures'), respond with ONLY this JSON:\n" +
+            "{\"command\":\"APPLYRULES\",\"target\":\"all\"}\n" +
+            "target can be: pipe, structure, or all.\n\n" +
+            "When the user wants to ASSIGN a SURFACE to pipe networks/pipes/structures (e.g. 'tüm networklere EG yüzeyini ata', 'X networküne Y yüzeyini tanımla'), respond with ONLY this JSON:\n" +
+            "{\"command\":\"ASSIGNSURFACE\",\"surface\":\"surface name\",\"network\":\"\"}\n" +
+            "Leave network empty for all networks, or specify a network name for just that one.\n\n" +
+            "When the user wants to DELETE entire pipe NETWORKS (e.g. 'X networkünü sil', 'A ve B networklerini sil', 'tüm pipe networkleri sil'), respond with ONLY this JSON:\n" +
+            "{\"command\":\"DELETENETWORKS\",\"networks\":\"name1,name2\"}\n" +
+            "Comma-separate multiple names. Leave networks empty to delete ALL pipe networks.\n\n" +
+            "When the user wants to edit pipe/structure NAMES or DESCRIPTIONS, use ONE of these JSON commands. " +
+            "partType is 'pipe', 'structure', or 'all'. network is empty for all networks or a specific network name.\n" +
+            "- Sequential rename: {\"command\":\"PARTSEQRENAME\",\"partType\":\"structure\",\"network\":\"\",\"prefix\":\"S\",\"start\":\"1\"}\n" +
+            "- Add prefix/suffix: {\"command\":\"PARTADDFIX\",\"partType\":\"all\",\"network\":\"\",\"prefix\":\"\",\"suffix\":\"\"}\n" +
+            "- Find/replace in names or descriptions: {\"command\":\"PARTFINDREPLACE\",\"partType\":\"all\",\"network\":\"\",\"find\":\"\",\"replace\":\"\",\"field\":\"name\"}\n" +
+            "  (field is 'name' or 'description')\n" +
+            "- Set description: {\"command\":\"PARTSETDESC\",\"partType\":\"pipe\",\"network\":\"\",\"description\":\"text\"}\n" +
+            "- Name/description by size: {\"command\":\"PARTSETBYSIZE\",\"partType\":\"pipe\",\"network\":\"\",\"target\":\"description\",\"template\":\"DN{size} pipe\"}\n" +
+            "  (target is 'name' or 'description'; use {size} placeholder for the diameter/width)\n" +
+            "- Name parts by their network (NetworkName.1, NetworkName.2...): {\"command\":\"PARTNAMEBYNETWORK\",\"partType\":\"structure\"}\n" +
+            "Respond with ONLY the JSON, no other text.\n\n" +
+            "When the user wants to ADD LABELS to pipes/structures, FIRST show available label styles. " +
+            "Respond with ONLY this JSON: {\"command\":\"LISTLABELSTYLES\"}\n" +
+            "After the system shows pipe and structure label styles, ask the user which style to use. " +
+            "Then add labels with ONLY this JSON:\n" +
+            "{\"command\":\"ADDLABELS\",\"partType\":\"all\",\"network\":\"\",\"pipeStyle\":\"x\",\"structStyle\":\"x\",\"pipeObjStyle\":\"\",\"structObjStyle\":\"\"}\n" +
+            "partType is pipe/structure/all. network empty for all networks. " +
+            "pipeStyle/structStyle are the LABEL styles to apply. " +
+            "pipeObjStyle/structObjStyle are OPTIONAL filters - only label parts whose OBJECT style matches (e.g. only structures with object style 'CB Gully'). Leave empty for no filter.\n" +
+            "Respond with ONLY the JSON, no other text.\n\n" +
+            "CRITICAL RULES FOR COMMANDS:\n" +
+            "1. Only output a JSON command if the user's request EXACTLY matches one of the commands listed above. " +
+            "If the requested action is not in the list, DO NOT invent or guess a command. Instead, reply in plain text " +
+            "explaining that this specific action is not supported yet, and briefly list what you CAN do.\n" +
+            "2. Never combine a JSON command with explanatory text. A command response must be ONLY the JSON.\n" +
+            "3. If you are unsure whether a request matches a command, ASK the user to clarify instead of guessing.\n" +
+            "4. For general design questions, calculations, or advice, respond normally as a Civil Engineering assistant WITHOUT any JSON.\n\n" +
+            "When the user wants to work with pipe/structure PROPERTIES, use ONE of these JSON commands. " +
+            "partType is 'pipe', 'structure', or 'all'. network is empty for all networks or a name.\n" +
+            "- Copy one field to another (e.g. 'pipe isimlerini açıklamaya kopyala', 'copy names to descriptions'): " +
+            "{\"command\":\"PARTCOPYFIELD\",\"partType\":\"pipe\",\"network\":\"\",\"from\":\"name\",\"to\":\"description\"}\n" +
+            "  (from/to can be 'name' or 'description')\n" +
+            "- List/read properties (e.g. 'seçili pipeların özelliklerini göster', 'tüm structureları listele'): " +
+            "{\"command\":\"PARTLISTPROPS\",\"partType\":\"all\",\"network\":\"\",\"selectedOnly\":\"false\"}\n" +
+            "  (selectedOnly 'true' = only currently selected parts in drawing)\n" +
+            "- Filter and select by a property (e.g. 'çapı 300den büyük boruları seç', 'select pipes longer than 50'): " +
+            "{\"command\":\"PARTFILTERSELECT\",\"partType\":\"pipe\",\"network\":\"\",\"property\":\"diameter\",\"op\":\"gt\",\"value1\":\"300\",\"value2\":\"\"}\n" +
+            "  (property: diameter(mm)/length/rim/sump/invert; op: gt/lt/ge/le/eq/between; value2 only for 'between')\n" +
+            "Respond with ONLY the JSON, no other text.\n\n" +
+            "When the user wants to read or filter POLYLINE/LINE properties (NOT pipe network parts), use ONE of these JSON commands:\n" +
+            "- List properties (e.g. 'polylinelerin özelliklerini göster', 'seçili çizgileri listele'): " +
+            "{\"command\":\"POLYLISTPROPS\",\"selectedOnly\":\"false\",\"layer\":\"\"}\n" +
+            "  (selectedOnly 'true' = only selected; layer empty = all layers)\n" +
+            "- Filter and select (e.g. 'uzunluğu 100den büyük polylineları seç', 'alanı 50den küçük olanları seç'): " +
+            "{\"command\":\"POLYFILTERSELECT\",\"property\":\"length\",\"op\":\"gt\",\"value1\":\"100\",\"value2\":\"\",\"layer\":\"\"}\n" +
+            "  (property: length/area/vertices; op: gt/lt/ge/le/eq/between; value2 only for 'between'; layer empty = all)\n" +
+            "Respond with ONLY the JSON, no other text.\n\n" +
+            "When the user wants to CHANGE polyline/line COLOR or LAYER (e.g. 'tüm kırmızı polylineları mavi yap', " +
+            "'X katmanındaki çizgileri Y katmanına taşı', 'kırmızı olanları yeşil yap'), respond with ONLY this JSON:\n" +
+            "{\"command\":\"POLYMODIFY\",\"fromColor\":\"kırmızı\",\"fromLayer\":\"\",\"newColor\":\"mavi\",\"newLayer\":\"\"}\n" +
+            "fromColor/fromLayer are filters (empty = no filter). newColor/newLayer are the changes (empty = don't change). " +
+            "Colors: kırmızı, sarı, yeşil, cyan, mavi, magenta, beyaz.\n" +
+            "Respond with ONLY the JSON, no other text.\n\n" +
+            "For all other questions, respond normally as a Civil Engineering assistant.";
+
+        public ClaudePanel()
+        {
+            BuildUI();
+            this.Loaded += (s, e) => LoadApiKey();
+        }
+
+        private void BuildUI()
+        {
+            Background = new SolidColorBrush(Color.FromRgb(30, 30, 30));
+
+            var grid = new Grid();
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            var header = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(8, 8, 8, 4) };
+            var title = new TextBlock { Text = "Claude AI", Foreground = Brushes.White, FontSize = 16, FontWeight = FontWeights.Bold, VerticalAlignment = VerticalAlignment.Center };
+            var clearBtn = new Button { Content = "Temizle", Margin = new Thickness(12, 0, 0, 0), Padding = new Thickness(8, 2, 8, 2), Background = new SolidColorBrush(Color.FromRgb(68, 68, 68)), Foreground = Brushes.White, BorderThickness = new Thickness(0) };
+            var contextBtn = new Button { Content = "📋 Bağlam Ekle", Margin = new Thickness(8, 0, 0, 0), Padding = new Thickness(8, 2, 8, 2), Background = new SolidColorBrush(Color.FromRgb(45, 106, 159)), Foreground = Brushes.White, BorderThickness = new Thickness(0) };
+            clearBtn.Click += ClearChat_Click;
+            contextBtn.Click += InjectContext_Click;
+            header.Children.Add(title);
+            header.Children.Add(clearBtn);
+            header.Children.Add(contextBtn);
+            Grid.SetRow(header, 0);
+
+            var apiKeyPanel = new StackPanel { Margin = new Thickness(8, 4, 8, 4) };
+            apiKeyPanel.Children.Add(new TextBlock { Text = "API Key:", Foreground = Brushes.Gray, FontSize = 11 });
+            _apiKeyBox = new PasswordBox { Background = new SolidColorBrush(Color.FromRgb(51, 51, 51)), Foreground = Brushes.White, BorderThickness = new Thickness(0), Padding = new Thickness(6) };
+            _apiKeyBox.PasswordChanged += (s, e) => SaveApiKey();
+            apiKeyPanel.Children.Add(_apiKeyBox);
+            Grid.SetRow(apiKeyPanel, 1);
+
+            _chatScroll = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Margin = new Thickness(8, 4, 8, 4) };
+            _chatMessages = new ListBox { Background = Brushes.Transparent, BorderThickness = new Thickness(0), ItemsSource = _messages };
+            _chatMessages.ItemTemplate = CreateMessageTemplate();
+            _chatScroll.Content = _chatMessages;
+            Grid.SetRow(_chatScroll, 2);
+
+            // Secenekler paneli (tiklanabilir butonlar)
+            _optionsScroll = new ScrollViewer
+            {
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                MaxHeight = 150,
+                Margin = new Thickness(8, 0, 8, 0)
+            };
+            _optionsPanel = new WrapPanel { Orientation = Orientation.Horizontal };
+            _optionsScroll.Content = _optionsPanel;
+            Grid.SetRow(_optionsScroll, 3);
+
+            var inputGrid = new Grid { Margin = new Thickness(8, 4, 8, 8) };
+            inputGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            inputGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            _userInput = new TextBox { Background = new SolidColorBrush(Color.FromRgb(51, 51, 51)), Foreground = Brushes.White, BorderThickness = new Thickness(0), Padding = new Thickness(8), FontSize = 13, TextWrapping = TextWrapping.Wrap, AcceptsReturn = true, MaxHeight = 100 };
+            _userInput.KeyDown += UserInput_KeyDown;
+            var sendBtn = new Button { Content = "Gönder", Margin = new Thickness(8, 0, 0, 0), Padding = new Thickness(12, 8, 12, 8), Background = new SolidColorBrush(Color.FromRgb(45, 106, 159)), Foreground = Brushes.White, BorderThickness = new Thickness(0) };
+            sendBtn.Click += Send_Click;
+            Grid.SetColumn(_userInput, 0);
+            Grid.SetColumn(sendBtn, 1);
+            inputGrid.Children.Add(_userInput);
+            inputGrid.Children.Add(sendBtn);
+            Grid.SetRow(inputGrid, 4);
+
+            grid.Children.Add(header);
+            grid.Children.Add(apiKeyPanel);
+            grid.Children.Add(_chatScroll);
+            grid.Children.Add(_optionsScroll);
+            grid.Children.Add(inputGrid);
+
+            Content = grid;
+        }
+
+        private DataTemplate CreateMessageTemplate()
+        {
+            var template = new DataTemplate();
+            var borderFactory = new FrameworkElementFactory(typeof(Border));
+            borderFactory.SetValue(Border.MarginProperty, new Thickness(0, 4, 0, 4));
+            borderFactory.SetValue(Border.PaddingProperty, new Thickness(8));
+            borderFactory.SetValue(Border.CornerRadiusProperty, new CornerRadius(6));
+            borderFactory.SetBinding(Border.BackgroundProperty, new System.Windows.Data.Binding("Background"));
+            var textFactory = new FrameworkElementFactory(typeof(TextBlock));
+            textFactory.SetBinding(TextBlock.TextProperty, new System.Windows.Data.Binding("Text"));
+            textFactory.SetValue(TextBlock.ForegroundProperty, Brushes.White);
+            textFactory.SetValue(TextBlock.TextWrappingProperty, TextWrapping.Wrap);
+            textFactory.SetValue(TextBlock.FontSizeProperty, 13.0);
+            borderFactory.AppendChild(textFactory);
+            template.VisualTree = borderFactory;
+            return template;
+        }
+
+        private ClaudeApiClient GetClient()
+        {
+            var key = _apiKeyBox.Password?.Trim();
+            if (string.IsNullOrEmpty(key))
+            {
+                AddMessage("⚠ Lütfen API key girin.", Brushes.DarkRed);
+                return null;
+            }
+            if (_client == null)
+                _client = new ClaudeApiClient(key);
+            return _client;
+        }
+
+        private async void Send_Click(object sender, RoutedEventArgs e) => await SendMessage();
+
+        private async void UserInput_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key == Key.Enter && !Keyboard.IsKeyDown(Key.LeftShift))
+            {
+                e.Handled = true;
+                await SendMessage();
+            }
+        }
+
+        // Yardimci: parsedCmd'den guvenli deger okuma
+        private static string Val(System.Collections.Generic.Dictionary<string, string> cmd, string key, string def = "")
+        {
+            return (cmd != null && cmd.ContainsKey(key) && cmd[key] != null) ? cmd[key] : def;
+        }
+
+        private static double ValD(System.Collections.Generic.Dictionary<string, string> cmd, string key, double def)
+        {
+            var s = Val(cmd, key, "");
+            if (string.IsNullOrWhiteSpace(s)) return def;
+            if (double.TryParse(s, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double r)) return r;
+            if (double.TryParse(s.Replace(',', '.'), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double r2)) return r2;
+            return def;
+        }
+
+        private static int ValI(System.Collections.Generic.Dictionary<string, string> cmd, string key, int def)
+        {
+            var s = Val(cmd, key, "");
+            if (int.TryParse(s, out int r)) return r;
+            return def;
+        }
+
+        private async Task SendMessage()
+        {
+            var text = _userInput.Text?.Trim();
+            if (string.IsNullOrEmpty(text)) return;
+
+            var client = GetClient();
+            if (client == null) return;
+
+            ClearOptions();
+
+            if (_injectContextNext)
+            {
+                var ctx = CivilContextHelper.GetDrawingContext();
+                text = $"[Drawing Context]\n{ctx}\n\n[User Question]\n{text}";
+                _injectContextNext = false;
+            }
+
+            AddMessage($"Siz: {_userInput.Text.Trim()}", new SolidColorBrush(Color.FromRgb(45, 70, 95)));
+            _userInput.Clear();
+
+            AddMessage("Claude düşünüyor...", new SolidColorBrush(Color.FromRgb(50, 50, 50)));
+
+            try
+            {
+                var reply = await client.SendMessageAsync(text, SystemPrompt);
+                _messages.RemoveAt(_messages.Count - 1);
+
+                var cleanReply = reply.Trim()
+                    .Replace("```json", "")
+                    .Replace("```", "")
+                    .Trim();
+
+                // Metin içinde JSON komutu varsa çıkar (denge parantez sayarak)
+                int jsonStart = cleanReply.IndexOf("{\"command\"");
+                if (jsonStart < 0) jsonStart = cleanReply.IndexOf("{ \"command\"");
+                if (jsonStart >= 0)
+                {
+                    int depth = 0;
+                    int jsonEnd = -1;
+                    bool inString = false;
+                    for (int ci = jsonStart; ci < cleanReply.Length; ci++)
+                    {
+                        char c = cleanReply[ci];
+                        if (c == '"' && (ci == 0 || cleanReply[ci - 1] != '\\'))
+                            inString = !inString;
+                        if (inString) continue;
+                        if (c == '{') depth++;
+                        else if (c == '}')
+                        {
+                            depth--;
+                            if (depth == 0) { jsonEnd = ci; break; }
+                        }
+                    }
+                    if (jsonEnd > jsonStart)
+                        cleanReply = cleanReply.Substring(jsonStart, jsonEnd - jsonStart + 1);
+                }
+
+                // JSON komutunu bir kere parse et, command alanini oku
+                string detectedCommand = "";
+                System.Collections.Generic.Dictionary<string, string> cmd = null;
+                if (cleanReply.StartsWith("{") && cleanReply.Contains("\"command\""))
+                {
+                    try
+                    {
+                        cmd = JsonConvert.DeserializeObject<System.Collections.Generic.Dictionary<string, string>>(cleanReply);
+                        if (cmd != null && cmd.ContainsKey("command"))
+                            detectedCommand = cmd["command"];
+                    }
+                    catch
+                    {
+                        detectedCommand = "";
+                        cmd = null;
+                    }
+                }
+
+                switch (detectedCommand)
+                {
+                    case "SELECT":
+                        {
+                            var result = DrawingCommandExecutor.SelectByFilter(Val(cmd, "objectType"), Val(cmd, "color"), Val(cmd, "layer"));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "BINDXREFS":
+                        {
+                            var result = XrefBinder.BindAllXrefs();
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "LISTSTYLES":
+                        {
+                            var list = AlignmentCreator.ListStylesAndLayers();
+                            ShowOptionsFromList(list);
+                            await RunFollowup(client,
+                                $"[Mevcut stiller ve katmanlar]\n{list}\n\nBunları kullanıcıya sun ve hangi alignment stili, label set ve katman kullanmak istediğini sor. Ayrıca hangi alignment'ın ana güzergah olduğunu sor.");
+                            break;
+                        }
+                    case "CREATEALIGNMENT":
+                        {
+                            string source = Val(cmd, "source", "filter");
+                            string result;
+                            if (source == "selection")
+                                result = AlignmentCreator.CreateFromSelection(Val(cmd, "style"), Val(cmd, "labelSet"), Val(cmd, "targetLayer"), Val(cmd, "mainAlignment"));
+                            else
+                                result = AlignmentCreator.CreateFromFilter(Val(cmd, "color"), Val(cmd, "layer"), Val(cmd, "style"), Val(cmd, "labelSet"), Val(cmd, "targetLayer"), Val(cmd, "mainAlignment"));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "RENAMEONE":
+                        {
+                            var result = AlignmentRenamer.RenameOne(Val(cmd, "oldName"), Val(cmd, "newName"));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "ADDFIX":
+                        {
+                            var result = AlignmentRenamer.AddPrefixSuffix(Val(cmd, "prefix"), Val(cmd, "suffix"));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "FINDREPLACE":
+                        {
+                            var result = AlignmentRenamer.FindReplace(Val(cmd, "find"), Val(cmd, "replace"));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "LISTALIGNMENTS":
+                        {
+                            var list = AlignmentRenamer.ListAlignments();
+                            ShowOptionsFromList(list);
+                            await RunFollowup(client, $"[Mevcut alignmentlar]\n{list}\n\nBunları kullanıcıya göster.");
+                            break;
+                        }
+                    case "LISTPARTS":
+                        {
+                            var list = PipeNetworkCreator.ListParts();
+                            ShowOptionsFromList(list);
+                            await RunFollowup(client,
+                                $"[Mevcut parts list, pipe ve structure aileleri]\n{list}\n\nBunları kullanıcıya sun ve hangi parts list, pipe ailesi ve structure ailesi kullanmak istediğini sor.");
+                            break;
+                        }
+                    case "CREATEPIPENETWORK":
+                        {
+                            var result = PipeNetworkCreator.CreateFromAlignments(
+                                Val(cmd, "partsList"), Val(cmd, "pipeFamily"), Val(cmd, "structureFamily"),
+                                Val(cmd, "pipeStyle"), Val(cmd, "structureStyle"), Val(cmd, "surface"),
+                                Val(cmd, "flowDirection", "start"),
+                                Val(cmd, "pipeSize"), Val(cmd, "structureSize"));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "DELETENETWORK":
+                        {
+                            var result = PipeNetworkDeleter.DeleteByNetworkName(Val(cmd, "networkName"));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "DELETESELECTED":
+                        {
+                            var result = PipeNetworkDeleter.DeleteSelected();
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "DELETEAREA":
+                        {
+                            var result = PipeNetworkDeleter.DeleteByArea(ValD(cmd, "minX", 0), ValD(cmd, "minY", 0), ValD(cmd, "maxX", 0), ValD(cmd, "maxY", 0));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "DELETEDIAMETER":
+                        {
+                            var result = PipeNetworkDeleter.DeleteByPipeDiameter(ValD(cmd, "minDia", 0), ValD(cmd, "maxDia", 0));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "DELETEDUPLICATES":
+                        {
+                            var result = PipeNetworkDeleter.DeleteDuplicateStructures(ValD(cmd, "tolerance", 0.5));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "CONNECTPIPES":
+                        {
+                            var result = PipeConnector.ConnectUnconnectedPipes(ValD(cmd, "tolerance", 0.5));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "APPLYRULES":
+                        {
+                            var result = RuleApplier.ApplyRules(Val(cmd, "target", "all"));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "ASSIGNSURFACE":
+                        {
+                            var result = SurfaceAssigner.AssignSurface(Val(cmd, "surface"), Val(cmd, "network"));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "DELETENETWORKS":
+                        {
+                            var result = PipeNetworkDeleter.DeleteNetworks(Val(cmd, "networks"));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "PARTSEQRENAME":
+                        {
+                            var result = PartRenamer.SequentialRename(Val(cmd, "partType", "all"), Val(cmd, "network"), Val(cmd, "prefix"), ValI(cmd, "start", 1));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "PARTADDFIX":
+                        {
+                            var result = PartRenamer.AddPrefixSuffix(Val(cmd, "partType", "all"), Val(cmd, "network"), Val(cmd, "prefix"), Val(cmd, "suffix"));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "PARTFINDREPLACE":
+                        {
+                            var result = PartRenamer.FindReplace(Val(cmd, "partType", "all"), Val(cmd, "network"), Val(cmd, "find"), Val(cmd, "replace"), Val(cmd, "field", "name"));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "PARTSETDESC":
+                        {
+                            var result = PartRenamer.SetDescription(Val(cmd, "partType", "all"), Val(cmd, "network"), Val(cmd, "description"));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "PARTSETBYSIZE":
+                        {
+                            var result = PartRenamer.SetBySize(Val(cmd, "partType", "all"), Val(cmd, "network"), Val(cmd, "target", "description"), Val(cmd, "template", "{size}"));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "PARTNAMEBYNETWORK":
+                        {
+                            var result = PartRenamer.NameByNetwork(Val(cmd, "partType", "all"));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "LISTLABELSTYLES":
+                        {
+                            var list = LabelPlacer.ListLabelStyles();
+                            ShowOptionsFromList(list);
+                            await RunFollowup(client,
+                                $"[Mevcut label stilleri]\n{list}\n\nBunları kullanıcıya sun ve hangi pipe ve/veya structure label stilini kullanmak istediğini sor.");
+                            break;
+                        }
+                    case "ADDLABELS":
+                        {
+                            var result = LabelPlacer.AddLabels(Val(cmd, "partType", "all"), Val(cmd, "network"), Val(cmd, "pipeStyle"), Val(cmd, "structStyle"),
+                                Val(cmd, "pipeObjStyle"), Val(cmd, "structObjStyle"));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "PARTCOPYFIELD":
+                        {
+                            var result = PartProperties.CopyField(Val(cmd, "partType", "all"), Val(cmd, "network"), Val(cmd, "from", "name"), Val(cmd, "to", "description"));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "PARTLISTPROPS":
+                        {
+                            bool selectedOnly = Val(cmd, "selectedOnly", "false") == "true";
+                            var result = PartProperties.ListProperties(Val(cmd, "partType", "all"), Val(cmd, "network"), selectedOnly);
+                            AddMessage(result, new SolidColorBrush(Color.FromRgb(40, 40, 40)));
+                            break;
+                        }
+                    case "PARTFILTERSELECT":
+                        {
+                            var result = PartProperties.FilterAndSelect(Val(cmd, "partType", "all"), Val(cmd, "network"),
+                                Val(cmd, "property", "diameter"), Val(cmd, "op", "gt"), ValD(cmd, "value1", 0), ValD(cmd, "value2", 0));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "POLYLISTPROPS":
+                        {
+                            bool selectedOnly = Val(cmd, "selectedOnly", "false") == "true";
+                            var result = PolylineProperties.ListProperties(selectedOnly, Val(cmd, "layer"));
+                            AddMessage(result, new SolidColorBrush(Color.FromRgb(40, 40, 40)));
+                            break;
+                        }
+                    case "POLYFILTERSELECT":
+                        {
+                            var result = PolylineProperties.FilterAndSelect(Val(cmd, "property", "length"), Val(cmd, "op", "gt"),
+                                ValD(cmd, "value1", 0), ValD(cmd, "value2", 0), Val(cmd, "layer"));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    case "POLYMODIFY":
+                        {
+                            var result = PolylineProperties.ModifyPolylines(Val(cmd, "fromColor"), Val(cmd, "fromLayer"), Val(cmd, "newColor"), Val(cmd, "newLayer"));
+                            AddMessage($"✅ {result}", new SolidColorBrush(Color.FromRgb(30, 80, 30)));
+                            break;
+                        }
+                    default:
+                        AddMessage($"Claude: {cleanReply}", new SolidColorBrush(Color.FromRgb(40, 40, 40)));
+                        break;
+                }
+            }
+            catch (System.Exception ex)
+            {
+                if (_messages.Count > 0 && _messages[_messages.Count - 1].Text == "Claude düşünüyor...")
+                    _messages.RemoveAt(_messages.Count - 1);
+                AddMessage($"Hata: {ex.Message}", Brushes.DarkRed);
+            }
+
+            _chatScroll.ScrollToBottom();
+        }
+
+        // Iki asamali komutlar icin: listeyi Claude'a gonder, cevabini goster
+        private async Task RunFollowup(ClaudeApiClient client, string message)
+        {
+            AddMessage("Claude düşünüyor...", new SolidColorBrush(Color.FromRgb(50, 50, 50)));
+            try
+            {
+                var followup = await client.SendMessageAsync(message, SystemPrompt);
+                _messages.RemoveAt(_messages.Count - 1);
+                AddMessage($"Claude: {followup}", new SolidColorBrush(Color.FromRgb(40, 40, 40)));
+            }
+            catch (System.Exception ex)
+            {
+                _messages.RemoveAt(_messages.Count - 1);
+                AddMessage($"Hata: {ex.Message}", Brushes.DarkRed);
+            }
+        }
+
+        // Secenek panelini temizle
+        private void ClearOptions()
+        {
+            _optionsPanel.Children.Clear();
+        }
+
+        // Ham liste metnini parse edip kategori basliklari altinda gruplu tiklanabilir butonlar olustur.
+        // Ayni isimli kategoriler tek baslik altinda toplanir.
+        private void ShowOptionsFromList(string rawList)
+        {
+            ClearOptions();
+            if (string.IsNullOrWhiteSpace(rawList)) return;
+
+            _optionsPanel.Orientation = Orientation.Vertical;
+
+            var lines = rawList.Replace("\r", "").Split('\n');
+            string currentCategory = "";
+            var categoryRows = new System.Collections.Generic.Dictionary<string, WrapPanel>();
+            var seen = new System.Collections.Generic.HashSet<string>();
+
+            foreach (var line in lines)
+            {
+                var trimmed = line.Trim();
+                if (trimmed.Length == 0) continue;
+
+                if (trimmed.StartsWith("- "))
+                {
+                    string item = trimmed.Substring(2).Trim();
+                    if (item.Length > 0)
+                        AddToCategory(categoryRows, seen, currentCategory, item);
+                }
+                else if (trimmed.Contains(":"))
+                {
+                    int idx = trimmed.IndexOf(':');
+                    string left = trimmed.Substring(0, idx).Trim();
+                    string right = (idx + 1 < trimmed.Length) ? trimmed.Substring(idx + 1).Trim() : "";
+                    currentCategory = left;
+                    EnsureCategoryRow(categoryRows, currentCategory);
+                    if (right.Length > 0)
+                        AddToCategory(categoryRows, seen, left, right);
+                }
+            }
+        }
+
+        private WrapPanel EnsureCategoryRow(System.Collections.Generic.Dictionary<string, WrapPanel> rows, string category)
+        {
+            if (string.IsNullOrEmpty(category)) category = "Seçenekler";
+            if (rows.ContainsKey(category)) return rows[category];
+
+            var header = new TextBlock
+            {
+                Text = category,
+                Foreground = new SolidColorBrush(Color.FromRgb(120, 170, 220)),
+                FontWeight = FontWeights.Bold,
+                FontSize = 11,
+                Margin = new Thickness(2, 6, 0, 2)
+            };
+            _optionsPanel.Children.Add(header);
+
+            var row = new WrapPanel { Orientation = Orientation.Horizontal };
+            _optionsPanel.Children.Add(row);
+            rows[category] = row;
+            return row;
+        }
+
+        private void AddToCategory(System.Collections.Generic.Dictionary<string, WrapPanel> rows,
+            System.Collections.Generic.HashSet<string> seen, string category, string value)
+        {
+            string key = (category ?? "") + "||" + value;
+            if (seen.Contains(key)) return;
+            seen.Add(key);
+
+            var row = EnsureCategoryRow(rows, category);
+            row.Children.Add(MakeOptionButton(category, value));
+        }
+
+        private Button MakeOptionButton(string category, string value)
+        {
+            var btn = new Button
+            {
+                Content = value,
+                Margin = new Thickness(3),
+                Padding = new Thickness(8, 3, 8, 3),
+                Background = new SolidColorBrush(Color.FromRgb(55, 65, 80)),
+                Foreground = Brushes.White,
+                BorderThickness = new Thickness(0),
+                ToolTip = string.IsNullOrEmpty(category) ? value : $"{category}: {value}"
+            };
+            string cat = category;
+            string val = value;
+            btn.Click += (s, e) =>
+            {
+                string addition = string.IsNullOrEmpty(cat) ? val : $"{cat}: {val}";
+                if (!string.IsNullOrEmpty(_userInput.Text) && !_userInput.Text.EndsWith("\n"))
+                    _userInput.Text += "\n";
+                _userInput.Text += addition;
+                _userInput.CaretIndex = _userInput.Text.Length;
+                _userInput.Focus();
+            };
+            return btn;
+        }
+
+        private void AddMessage(string text, Brush bg)
+        {
+            _messages.Add(new ChatMessage { Text = text, Background = bg });
+        }
+
+        private void ClearChat_Click(object sender, RoutedEventArgs e)
+        {
+            _messages.Clear();
+            _client?.ClearHistory();
+            ClearOptions();
+        }
+
+        private string GetConfigPath()
+        {
+            var dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "CivilClaudePlugin");
+            Directory.CreateDirectory(dir);
+            return Path.Combine(dir, "config.json");
+        }
+
+        private void LoadApiKey()
+        {
+            try
+            {
+                var path = GetConfigPath();
+                if (File.Exists(path))
+                {
+                    var json = File.ReadAllText(path);
+                    var data = JsonConvert.DeserializeObject<System.Collections.Generic.Dictionary<string, string>>(json);
+                    if (data != null && data.ContainsKey("apiKey"))
+                        _apiKeyBox.Password = data["apiKey"];
+                }
+            }
+            catch { }
+        }
+
+        private void SaveApiKey()
+        {
+            try
+            {
+                var key = _apiKeyBox.Password;
+                if (string.IsNullOrEmpty(key)) return;
+                var data = new System.Collections.Generic.Dictionary<string, string>
+                {
+                    { "apiKey", key }
+                };
+                File.WriteAllText(GetConfigPath(), JsonConvert.SerializeObject(data));
+            }
+            catch { }
+        }
+
+        private void InjectContext_Click(object sender, RoutedEventArgs e)
+        {
+            _injectContextNext = true;
+            AddMessage("ℹ Drawing context bir sonraki mesaja eklenecek.", new SolidColorBrush(Color.FromRgb(47, 79, 79)));
+        }
+    }
+}
